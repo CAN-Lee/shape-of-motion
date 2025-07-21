@@ -12,3 +12,12 @@ results/
 
 preproc/checkpoints
 preproc/checkpoints/
+
+# Large directories and files
+data/
+Gaussian_Sequence/
+output/
+refined_output/
+*.png
+*.jpg
+*.jpeg

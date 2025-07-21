@@ -7,6 +7,14 @@
 
 \* Equal Contribution
 
+## New command
+
+example:
+
+```
+CUDA_VISIBLE_DEVICES=1 python run_deform_training.py --num-epochs 2 --batch-size 1 --sequence-length 3 --validate-every 1 --save-every 1 --use-chunked-processing --chunk-size 500 data:iphone --data.data-dir data/iPhone/paper-windmill
+```
+
 ## *New
 We have preprocessed nvidia dataset and custom dataset which can be found [here](https://drive.google.com/drive/folders/1xzn-Mu_jyr-JTsrERRU-Mh2hQ-NWdfv8). We used [MegaSaM](https://mega-sam.github.io/) to get cameras and depths for custom dataset.
 ### Training

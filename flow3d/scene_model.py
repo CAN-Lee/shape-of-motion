@@ -87,7 +87,7 @@ class SceneModel(nn.Module):
             means = means[inds]
             quats = quats[inds]
         if ts is not None:
-            transfms = self.compute_transforms(ts, inds)  # (G, B, 3, 4)
+            transfms = self.compute_transforms(ts, inds)  # (G, B, 3, 4) 根据motion_bases计算的transforms
             means = torch.einsum(
                 "pnij,pj->pni",
                 transfms,
@@ -103,8 +103,8 @@ class SceneModel(nn.Module):
             )
             quats = F.normalize(quats, p=2, dim=-1)
         else:
-            means = means[:, None]
-            quats = quats[:, None]
+            means = means[:, None] # (G, 1, 3)
+            quats = quats[:, None] # (G, 1, 4)
         return means, quats
 
     def compute_poses_all(
@@ -177,7 +177,7 @@ class SceneModel(nn.Module):
     def render(
         self,
         # A single time instance for view rendering.
-        t: int | None,
+        t: int | None, # 不传入t，也可以？
         w2cs: torch.Tensor,  # (C, 4, 4)
         Ks: torch.Tensor,  # (C, 3, 3)
         img_wh: tuple[int, int],
@@ -211,8 +211,8 @@ class SceneModel(nn.Module):
             means, quats = pose_fnc(
                 torch.tensor([t], device=device) if t is not None else None
             )
-            means = means[:, 0]
-            quats = quats[:, 0]
+            means = means[:, 0] # (G, 3)
+            quats = quats[:, 0] # (G, 4)
 
         if colors_override is None:
             if return_color:
