@@ -26,6 +26,12 @@ Examples:
     # Use full processing (faster but more memory)
     python run_deform_training.py --work_dir ./output --scene_model_path ./model.ckpt --use_chunked_processing false nvidia
 
+    # Resume training from latest checkpoint (automatically detected)
+    python run_deform_training.py --work_dir ./output --scene_model_path ./model.ckpt nvidia
+
+    # Resume training from specific checkpoint
+    python run_deform_training.py --work_dir ./output --scene_model_path ./model.ckpt --resume_from ./output/deform_checkpoint_epoch_50.pth nvidia
+
     # Render full sequence for better temporal consistency
     python run_deform_training.py --work_dir ./output --scene_model_path ./model.ckpt --render_full_sequence true nvidia
 
@@ -50,6 +56,7 @@ import yaml
 from loguru import logger as guru
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import math
 
 from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
 from flow3d.data import (
@@ -96,8 +103,10 @@ class DeformTrainConfig:
     # 可选参数（有默认值）
     work_dir: str = "refined_output"
     scene_model_path: str = "output/paper-windmill-result/checkpoints/last.ckpt"  # 预训练的scene model路径
+    resume_from: str | None = None  # 指定deform model checkpoint路径进行恢复训练，None则自动查找latest
     # Deform model 参数
-    lstm_input_dim: int = 3
+    temporal_encoding_dim: int = 16  # 时间编码维度
+    lstm_input_dim: int = 19  # 3 (位置) + 16 (时间编码) = 19
     lstm_hidden_dim: int = 256
     lstm_num_layers: int = 2
     lstm_dropout: float = 0.1
@@ -126,7 +135,9 @@ class DeformTrainConfig:
     vis_debug: bool = False
     validate_every: int = 10
     save_every: int = 20
+    save_videos_every: int = 50  # 保存视频的频率
     use_2dgs: bool = False
+    devices: str = "0"  # CUDA设备索引，支持多GPU如"0,1"
 
 
 class DeformTrainer:
@@ -176,6 +187,41 @@ class DeformTrainer:
         # 保存配置
         with open(f"{config.work_dir}/deform_config.yaml", "w") as f:
             yaml.dump(asdict(config), f, default_flow_style=False)
+    
+    def temporal_encoding(self, timesteps, d_model=None):
+        """
+        使用正弦位置编码来表示时间信息
+        
+        Args:
+            timesteps: 时间戳序列 (seq_len,) 
+            d_model: 编码维度，默认使用config中的temporal_encoding_dim
+            
+        Returns:
+            torch.Tensor: 时间编码 (seq_len, d_model)
+        """
+        if d_model is None:
+            d_model = self.config.temporal_encoding_dim
+            
+        seq_len = len(timesteps)
+        pe = torch.zeros(seq_len, d_model, device=self.device)
+        
+        # 归一化时间戳到[0, 1]范围
+        max_time = self.train_dataset.num_frames - 1
+        normalized_timesteps = timesteps.float() / max_time
+        
+        position = normalized_timesteps.unsqueeze(1)  # (seq_len, 1)
+        
+        # 计算不同频率的分量
+        div_term = torch.exp(torch.arange(0, d_model, 2, device=self.device).float() * 
+                           -(math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数位置使用sin
+        if d_model % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])  # 奇数维度情况
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)  # 奇数位置使用cos
+            
+        return pe
     
     def extract_gaussian_sequences(self, batch) -> dict:
         """从scene model中提取高斯序列
@@ -367,7 +413,7 @@ class DeformTrainer:
                         )
                         
                         # 立即提取图像并释放rendered字典以节省内存
-                        img = rendered["img"][0].clone()
+                        img = rendered["img"][0].clone() # 去掉batch维度得到 (H, W, 3)
                         del rendered
                         batch_rendered_imgs.append(img)
                         
@@ -383,7 +429,14 @@ class DeformTrainer:
         
     
     def train_step(self, batch):
-        """单步训练"""
+        """单步训练
+        batch:
+            imgs: (batch_size, height, width, channels) 原始图像
+            ts: (batch_size,) 每帧的时间戳
+            w2cs: (batch_size, 4, 4) 世界坐标到相机坐标的变换矩阵
+            Ks: (batch_size, 3, 3) 相机内参矩阵
+            ...
+        """
         import time
         step_start = time.time()
         
@@ -399,7 +452,7 @@ class DeformTrainer:
         # 每个键的值是一个张量，形状为 (batch_size, sequence_length, num_gaussians, dim)
         gaussian_sequences = self.extract_gaussian_sequences(batch)
         seq_time = time.time() - seq_start
-        print("seq_extract_time: ", seq_time)
+        # print("seq_extract_time: ", seq_time)
         
         # 2. 使用deform model优化序列
         deform_start = time.time()
@@ -426,6 +479,10 @@ class DeformTrainer:
         for b in range(batch_size):
             sample_positions = positions_input[b]  # (num_gaussians, seq_len, 3) - 单个样本的所有高斯点位置序列
             
+            # 获取时间编码
+            frame_timesteps = gaussian_sequences['frame_ts'][b]  # (seq_len,)
+            time_encoding = self.temporal_encoding(frame_timesteps)  # (seq_len, temporal_encoding_dim)
+            
             if self.config.use_chunked_processing:
                 # 分块处理高斯点（节省内存）
                 chunk_size = self.config.chunk_size
@@ -437,8 +494,17 @@ class DeformTrainer:
                     chunk_end = min(chunk_start + chunk_size, num_gaussians)
                     chunk_positions = sample_positions[chunk_start:chunk_end]  # (chunk_size, seq_len, 3)
                     
+                    # 为每个高斯点复制时间编码
+                    chunk_size_actual = chunk_positions.shape[0] # chunked高斯点数量
+                    chunk_time_encoding = time_encoding.unsqueeze(0).expand(chunk_size_actual, -1, -1)  
+                    # (chunk_size, seq_len, temporal_encoding_dim)
+                    
+                    # 拼接位置和时间编码
+                    chunk_input = torch.cat([chunk_positions, chunk_time_encoding], dim=-1)  
+                    # (chunk_size, seq_len, 3 + temporal_encoding_dim)
+                    
                     # 前向传播 - 直接获取deltas
-                    deltas = self.deform_model(chunk_positions)
+                    deltas = self.deform_model(chunk_input)
                     # return: delta_pos, delta_quat, delta_scale
                     # shape: (chunk_size, seq_len, 3), (chunk_size, seq_len, 4), (chunk_size, seq_len, 3)
                     
@@ -456,7 +522,13 @@ class DeformTrainer:
                 
             else:
                 # 不分块处理
-                deltas = self.deform_model(sample_positions)
+                # 为所有高斯点复制时间编码
+                sample_time_encoding = time_encoding.unsqueeze(0).expand(num_gaussians, -1, -1)  # (num_gaussians, seq_len, temporal_encoding_dim)
+                
+                # 拼接位置和时间编码
+                sample_input = torch.cat([sample_positions, sample_time_encoding], dim=-1)  # (num_gaussians, seq_len, 3 + temporal_encoding_dim)
+                
+                deltas = self.deform_model(sample_input)
                 
                 # 直接添加结果，调整维度顺序
                 deltas_sequence['delta_pos'].append(deltas['delta_pos'].transpose(0, 1))
@@ -470,7 +542,7 @@ class DeformTrainer:
             # shape: (batch_size, seq_len, num_gaussians, dim)
         
         deform_time = time.time() - deform_start
-        print("deform_time: ", deform_time)
+        # print("deform_time: ", deform_time)
         
         # 3. 渲染并计算损失
         render_start = time.time()
@@ -478,7 +550,7 @@ class DeformTrainer:
         with torch.cuda.amp.autocast(enabled=False):  # 禁用自动混合精度以避免潜在的内存问题
             rendered_imgs = self.render_with_deformed_gaussians(batch, gaussian_sequences['frame_ts'], deltas_sequence)
         render_time = time.time() - render_start
-        print("render_time: ", render_time)
+        # print("render_time: ", render_time)
 
         # 4. 损失计算
         loss_start = time.time()
@@ -519,7 +591,7 @@ class DeformTrainer:
             rgb_loss = (1 - self.config.ssim_weight) * l1_rgb_loss + self.config.ssim_weight * ssim_rgb_loss    
             
         loss_time = time.time() - loss_start
-        print("loss_time: ", loss_time)
+        # print("loss_time: ", loss_time)
 
         # 5. 反向传播
         backward_start = time.time()
@@ -533,9 +605,9 @@ class DeformTrainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
         backward_time = time.time() - backward_start
-        print("backward_time: ", backward_time)
+        # print("backward_time: ", backward_time)
         total_time = time.time() - step_start
-        print("total_time: ", total_time)
+        # print("total_time: ", total_time)
 
         # 打印各步骤耗时
         if self.global_step % 10 == 0:
@@ -563,85 +635,120 @@ class DeformTrainer:
         updated_quat = original_quat + delta_quat
         return torch.nn.functional.normalize(updated_quat, p=2, dim=-1)
     
-    def validate(self, val_loader):
-        """验证"""
-        self.deform_model.eval()
-        total_loss = 0.0
-        num_batches = 0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = to_device(batch, self.device)
-                
-                # 简化的验证步骤 - 使用与训练相同的处理逻辑
-                gaussian_sequences = self.extract_gaussian_sequences(batch)
-                
-                # 手动处理验证数据（与训练步骤相同）
-                batch_size, seq_len, num_gaussians, _ = gaussian_sequences['positions'].shape
-                positions_input = gaussian_sequences['positions'].transpose(1, 2)  # (batch_size, num_gaussians, seq_len, 3)
-                
-                deltas_sequence = {
-                    'delta_pos': [],
-                    'delta_quat': [],
-                    'delta_scale': [],
-                }
-                
-                for b in range(batch_size):
-                    sample_positions = positions_input[b]  # (num_gaussians, seq_len, 3)
+    def create_deformed_scene_model(self):
+        """创建一个集成了变形模型的SceneModel包装器"""
+        class DeformedSceneModel:
+            def __init__(self, scene_model, deform_model, trainer):
+                self.scene_model = scene_model # 来自trainer.scene_model
+                self.deform_model = deform_model # 来自trainer.deform_model
+                self.trainer = trainer # 来自trainer
+                # 复制scene_model的属性以保持兼容性
+                self.has_bg = scene_model.has_bg
+                self.num_gaussians = scene_model.num_gaussians
+                self.num_fg_gaussians = scene_model.num_fg_gaussians
+                self.num_bg_gaussians = scene_model.num_bg_gaussians
+                 
+            def eval(self):
+                """设置为评估模式"""
+                self.deform_model.eval()
+                return self
+                 
+            def train(self, mode=True):
+                """设置训练模式"""
+                self.deform_model.train(mode)
+                return self
+                 
+            def render(self, t, w2c, K, img_wh, **kwargs):
+                """渲染单帧，应用变形"""
+                # 只对单个时间戳进行变形
+                with torch.no_grad():
+                    # 1. 获取原始高斯参数
+                    original_means = self.scene_model.fg.params["means"]
+                    original_quats = self.scene_model.fg.params["quats"]
+                    original_scales = self.scene_model.fg.params["scales"]
+                    num_gaussians = original_means.shape[0]
                     
-                    # 使用分块处理（与训练一致）
-                    if self.config.use_chunked_processing:
-                        chunk_size = self.config.chunk_size
-                        sample_delta_pos = []
-                        sample_delta_quat = []
-                        sample_delta_scale = []
+                    # 2. 构造单帧输入
+                    positions = original_means.unsqueeze(0).unsqueeze(0)  # (1, 1, num_gaussians, 3)
+                    frame_ts = torch.tensor([t], device=self.trainer.device)  # (1,)
+                    
+                    # 3. 获取时间编码
+                    time_encoding = self.trainer.temporal_encoding(frame_ts)  # (1, temporal_encoding_dim)
+                    
+                    # 4. 应用变形模型
+                    positions_input = positions.transpose(1, 2)  # (1, num_gaussians, 1, 3)
+                    sample_positions = positions_input[0]  # (num_gaussians, 1, 3)
+                    
+                    # 使用分块处理以节省内存（与训练时一致）
+                    if self.trainer.config.use_chunked_processing:
+                        chunk_size = self.trainer.config.chunk_size
+                        delta_pos_chunks = []
+                        delta_quat_chunks = []
+                        delta_scale_chunks = []
                         
                         for chunk_start in range(0, num_gaussians, chunk_size):
                             chunk_end = min(chunk_start + chunk_size, num_gaussians)
-                            chunk_positions = sample_positions[chunk_start:chunk_end]
+                            chunk_positions = sample_positions[chunk_start:chunk_end]  # (chunk_size, 1, 3)
                             
-                            deltas = self.deform_model(chunk_positions)
-                            sample_delta_pos.append(deltas['delta_pos'])
-                            sample_delta_quat.append(deltas['delta_quat'])
-                            sample_delta_scale.append(deltas['delta_scale'])
+                            # 为每个高斯点复制时间编码
+                            chunk_size_actual = chunk_positions.shape[0]
+                            chunk_time_encoding = time_encoding.unsqueeze(0).expand(chunk_size_actual, -1, -1)  # (chunk_size, 1, temporal_encoding_dim)
+                            
+                            # 拼接位置和时间编码
+                            chunk_input = torch.cat([chunk_positions, chunk_time_encoding], dim=-1)  # (chunk_size, 1, 3 + temporal_encoding_dim)
+                            
+                            # 前向传播获取变形增量
+                            chunk_deltas = self.deform_model(chunk_input)
+                            delta_pos_chunks.append(chunk_deltas['delta_pos'][:, 0, :])  # (chunk_size, 3)
+                            delta_quat_chunks.append(chunk_deltas['delta_quat'][:, 0, :])  # (chunk_size, 4)
+                            delta_scale_chunks.append(chunk_deltas['delta_scale'][:, 0, :])  # (chunk_size, 3)
                         
-                        deltas_sequence['delta_pos'].append(torch.cat(sample_delta_pos, dim=0).transpose(0, 1))
-                        deltas_sequence['delta_quat'].append(torch.cat(sample_delta_quat, dim=0).transpose(0, 1))
-                        deltas_sequence['delta_scale'].append(torch.cat(sample_delta_scale, dim=0).transpose(0, 1))
+                        delta_pos = torch.cat(delta_pos_chunks, dim=0)  # (num_gaussians, 3)
+                        delta_quat = torch.cat(delta_quat_chunks, dim=0)  # (num_gaussians, 4)
+                        delta_scale = torch.cat(delta_scale_chunks, dim=0)  # (num_gaussians, 3)
                     else:
-                        deltas = self.deform_model(sample_positions)
-                        deltas_sequence['delta_pos'].append(deltas['delta_pos'].transpose(0, 1))
-                        deltas_sequence['delta_quat'].append(deltas['delta_quat'].transpose(0, 1))
-                        deltas_sequence['delta_scale'].append(deltas['delta_scale'].transpose(0, 1))
-                
-                # 堆叠批次
-                for key in deltas_sequence:
-                    deltas_sequence[key] = torch.stack(deltas_sequence[key], dim=0)
-                
-                rendered_imgs = self.render_with_deformed_gaussians(batch, gaussian_sequences['frame_ts'], deltas_sequence)
-                
-                # 使用与训练相同的L1+SSIM组合损失
-                target_imgs = batch["imgs"]  # (B, H, W, C)
-                
-                # 处理形状不匹配问题：如果渲染了全序列，只取中心帧进行验证
-                if len(rendered_imgs.shape) == 5:  # (B, T, H, W, C)
-                    seq_center = rendered_imgs.shape[1] // 2
-                    rendered_imgs_val = rendered_imgs[:, seq_center]  # (B, H, W, C)
-                else:  # (B, H, W, C)
-                    rendered_imgs_val = rendered_imgs
-                
-                l1_val_loss = l1_loss(rendered_imgs_val, target_imgs)
-                
-                # SSIM需要(N, C, H, W)格式
-                rendered_ssim = rendered_imgs_val.permute(0, 3, 1, 2)  # (B, C, H, W)
-                target_ssim = target_imgs.permute(0, 3, 1, 2)  # (B, C, H, W)
-                
-                ssim_val_loss = 1.0 - ssim(rendered_ssim, target_ssim)
-                val_loss = (1 - self.config.ssim_weight) * l1_val_loss + self.config.ssim_weight * ssim_val_loss
-                total_loss += val_loss.item()
-                num_batches += 1
+                        # 为每个高斯点复制时间编码
+                        sample_time_encoding = time_encoding.unsqueeze(0).expand(num_gaussians, -1, -1)  # (num_gaussians, 1, temporal_encoding_dim)
+                        
+                        # 拼接位置和时间编码
+                        sample_input = torch.cat([sample_positions, sample_time_encoding], dim=-1)  # (num_gaussians, 1, 3 + temporal_encoding_dim)
+                        
+                        # 前向传播获取变形增量
+                        deltas = self.deform_model(sample_input)
+                        delta_pos = deltas['delta_pos'][:, 0, :]  # (num_gaussians, 3)
+                        delta_quat = deltas['delta_quat'][:, 0, :]  # (num_gaussians, 4)
+                        delta_scale = deltas['delta_scale'][:, 0, :]  # (num_gaussians, 3)
+                    
+                    # 5. 应用scene model的时间变换
+                    means, quats = self.scene_model.compute_poses_fg(torch.tensor([t], device=self.trainer.device))
+                    transformed_means = means[:, 0, :]  # (num_gaussians, 3)
+                    transformed_quats = quats[:, 0, :]  # (num_gaussians, 4)
+                    transformed_scales = self.scene_model.fg.get_scales()  # (num_gaussians, 3)
+                    
+                    # 6. 应用变形增量
+                    final_means = transformed_means + delta_pos
+                    final_quats = self.trainer._apply_quat_delta(transformed_quats, delta_quat)
+                    final_scales = transformed_scales * torch.exp(delta_scale)
+                    
+                    # 7. 临时替换参数并渲染
+                    original_means_backup = self.scene_model.fg.params["means"]
+                    original_quats_backup = self.scene_model.fg.params["quats"]
+                    original_scales_backup = self.scene_model.fg.params["scales"]
+                    
+                    try:
+                        self.scene_model.fg.params["means"] = final_means
+                        self.scene_model.fg.params["quats"] = final_quats
+                        self.scene_model.fg.params["scales"] = final_scales
+                        
+                        # 渲染时传入None避免重复变换
+                        return self.scene_model.render(None, w2c, K, img_wh, **kwargs)
+                    finally:
+                        # 恢复原始参数
+                        self.scene_model.fg.params["means"] = original_means_backup
+                        self.scene_model.fg.params["quats"] = original_quats_backup
+                        self.scene_model.fg.params["scales"] = original_scales_backup
         
-        return total_loss / num_batches if num_batches > 0 else 0.0
+        return DeformedSceneModel(self.scene_model, self.deform_model, self)
     
     def save_checkpoint(self, path: str):
         """保存检查点"""
@@ -671,9 +778,14 @@ def main(cfg: DeformTrainConfig):
     # 创建工作目录
     os.makedirs(cfg.work_dir, exist_ok=True)
     
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    guru.info(f"Using device: {device}")
+    # 设置CUDA设备
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = cfg.devices
+        device = torch.device("cuda:0")  # 使用第一个可见设备
+        guru.info(f"Using CUDA devices: {cfg.devices}, mapped to cuda:0")
+    else:
+        device = torch.device("cpu")
+        guru.info("CUDA not available, using CPU")
     
     # 加载数据
     train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
@@ -690,15 +802,6 @@ def main(cfg: DeformTrainConfig):
         collate_fn=BaseDataset.train_collate_fn,
     )
     # train_loader 中的dataset 包含 frame_names, time_ids, imgs, masks, tracks, Ks, w2cs等
-    
-    val_loader = None
-    if val_img_dataset is not None:
-        val_loader = DataLoader(
-            val_img_dataset,
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_dl_workers,
-            collate_fn=BaseDataset.train_collate_fn,
-        )
     
     # 加载预训练的scene model
     guru.info(f"Loading scene model from {cfg.scene_model_path}")
@@ -723,9 +826,57 @@ def main(cfg: DeformTrainConfig):
     # 创建训练器
     trainer = DeformTrainer(scene_model, deform_model, device, cfg, train_dataset)
     
+    # 检查并加载checkpoint
+    start_epoch = 0
+    if cfg.resume_from is not None:
+        # 用户指定了特定的checkpoint路径
+        if os.path.exists(cfg.resume_from):
+            guru.info(f"Loading specified checkpoint: {cfg.resume_from}")
+            trainer.load_checkpoint(cfg.resume_from)
+            start_epoch = trainer.epoch + 1
+            guru.info(f"Resumed training from epoch {start_epoch}, step {trainer.global_step}")
+        else:
+            guru.error(f"Specified checkpoint not found: {cfg.resume_from}")
+            raise FileNotFoundError(f"Checkpoint not found: {cfg.resume_from}")
+    else:
+        # 自动查找最新的checkpoint
+        checkpoint_path = f"{cfg.work_dir}/deform_checkpoint_latest.pth"
+        if os.path.exists(checkpoint_path):
+            guru.info(f"Found latest checkpoint at {checkpoint_path}, loading...")
+            trainer.load_checkpoint(checkpoint_path)
+            start_epoch = trainer.epoch + 1
+            guru.info(f"Resumed training from epoch {start_epoch}, step {trainer.global_step}")
+        else:
+            guru.info("No checkpoint found, starting training from scratch")
+    
+    # 创建验证器（使用flow3d.validator.Validator）
+    validator = None
+    if (
+        train_video_view is not None
+        or val_img_dataset is not None
+        or val_kpt_dataset is not None
+    ):
+        # 创建集成了变形模型的SceneModel包装器
+        deformed_scene_model = trainer.create_deformed_scene_model()
+        
+        validator = Validator(
+            model=deformed_scene_model,
+            device=device,
+            train_loader=(
+                DataLoader(train_video_view, batch_size=1) if train_video_view else None
+            ),
+            val_img_loader=(
+                DataLoader(val_img_dataset, batch_size=1) if val_img_dataset else None
+            ),
+            val_kpt_loader=(
+                DataLoader(val_kpt_dataset, batch_size=1) if val_kpt_dataset else None
+            ),
+            save_dir=cfg.work_dir,
+        )
+    
     # 训练循环
-    guru.info("Starting deform model training...")
-    for epoch in tqdm(range(cfg.num_epochs), desc="Epochs"):
+    guru.info(f"Starting deform model training from epoch {start_epoch}...")
+    for epoch in tqdm(range(start_epoch, cfg.num_epochs), desc="Epochs", initial=start_epoch, total=cfg.num_epochs):
         trainer.epoch = epoch
         
         # 训练
@@ -746,14 +897,28 @@ def main(cfg: DeformTrainConfig):
         guru.info(f"Epoch {epoch} - Average Loss: {avg_loss:.6f}")
         
         # 验证
-        if val_loader is not None and (epoch + 1) % cfg.validate_every == 0:
-            val_loss = trainer.validate(val_loader)
-            guru.info(f"Epoch {epoch} - Validation Loss: {val_loss:.6f}")
+        if validator is not None and (epoch + 1) % cfg.validate_every == 0:
+            # 设置变形模型为评估模式
+            trainer.deform_model.eval()
+            val_logs = validator.validate()
+            guru.info(f"Epoch {epoch} - Validation metrics: {val_logs}")
+            # 恢复训练模式
+            trainer.deform_model.train()
+            
+        # 保存视频（可选）
+        if validator is not None and (epoch > 0 and (epoch + 1) % cfg.save_videos_every == 0) or (epoch == cfg.num_epochs - 1):
+            trainer.deform_model.eval()
+            validator.save_train_videos(epoch)
+            trainer.deform_model.train()
         
         # 保存检查点
         if (epoch + 1) % cfg.save_every == 0:
             checkpoint_path = f"{cfg.work_dir}/deform_checkpoint_epoch_{epoch+1}.pth"
             trainer.save_checkpoint(checkpoint_path)
+        
+        # 始终保存最新的checkpoint（用于断点续训）
+        latest_checkpoint_path = f"{cfg.work_dir}/deform_checkpoint_latest.pth"
+        trainer.save_checkpoint(latest_checkpoint_path)
         
         # 更新学习率
         trainer.scheduler.step()

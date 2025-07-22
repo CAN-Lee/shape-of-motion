@@ -50,6 +50,7 @@ import yaml
 from loguru import logger as guru
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import math
 
 from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
 from flow3d.data import (
@@ -97,7 +98,8 @@ class DeformTrainConfig:
     work_dir: str = "refined_output"
     scene_model_path: str = "output/paper-windmill-result/checkpoints/last.ckpt"  # 预训练的scene model路径
     # Deform model 参数
-    lstm_input_dim: int = 3
+    temporal_encoding_dim: int = 16  # 时间编码维度
+    lstm_input_dim: int = 19  # 3 (位置) + 16 (时间编码) = 19
     lstm_hidden_dim: int = 256
     lstm_num_layers: int = 2
     lstm_dropout: float = 0.1
@@ -127,6 +129,7 @@ class DeformTrainConfig:
     validate_every: int = 10
     save_every: int = 20
     use_2dgs: bool = False
+    devices: str = "0"  # CUDA设备索引，支持多GPU如"0,1"
 
 
 class DeformTrainer:
@@ -177,11 +180,46 @@ class DeformTrainer:
         with open(f"{config.work_dir}/deform_config.yaml", "w") as f:
             yaml.dump(asdict(config), f, default_flow_style=False)
     
+    def temporal_encoding(self, timesteps, d_model=None):
+        """
+        使用正弦位置编码来表示时间信息
+        
+        Args:
+            timesteps: 时间戳序列 (seq_len,) 
+            d_model: 编码维度，默认使用config中的temporal_encoding_dim
+            
+        Returns:
+            torch.Tensor: 时间编码 (seq_len, d_model)
+        """
+        if d_model is None:
+            d_model = self.config.temporal_encoding_dim
+            
+        seq_len = len(timesteps)
+        pe = torch.zeros(seq_len, d_model, device=self.device)
+        
+        # 归一化时间戳到[0, 1]范围
+        max_time = self.train_dataset.num_frames - 1
+        normalized_timesteps = timesteps.float() / max_time
+        
+        position = normalized_timesteps.unsqueeze(1)  # (seq_len, 1)
+        
+        # 计算不同频率的分量
+        div_term = torch.exp(torch.arange(0, d_model, 2, device=self.device).float() * 
+                           -(math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数位置使用sin
+        if d_model % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])  # 奇数维度情况
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)  # 奇数位置使用cos
+            
+        return pe
+    
     def extract_gaussian_sequences(self, batch) -> dict:
         """从scene model中提取高斯序列
         
-        从scene model中提取指定batch的高斯序列,包括位置、方向和尺度参数。
-        对于每个batch样本,提取以当前帧为中心的sequence_length帧序列。
+        提取原始高斯参数和对应的时间戳序列，不进行预变换。
+        变换将在渲染时进行。
         
         Args:
             batch: 包含以下键的字典:
@@ -190,101 +228,102 @@ class DeformTrainer:
         
         Returns:
             包含以下键的字典:
-                - positions: 高斯位置序列 (batch_size, sequence_length, num_gaussians, 3)
-                - orientations: 高斯方向序列 (batch_size, sequence_length, num_gaussians, 4) 
-                - scales: 高斯尺度序列 (batch_size, sequence_length, num_gaussians, 3)
+                - positions: 原始高斯位置 (batch_size, sequence_length, num_gaussians, 3)
+                - orientations: 原始高斯方向 (batch_size, sequence_length, num_gaussians, 4) 
+                - scales: 原始高斯尺度 (batch_size, sequence_length, num_gaussians, 3)
+                - frame_ts: 序列帧时间戳 (batch_size, sequence_length)
                 - target_images: 真实的序列目标图像 (batch_size, sequence_length, H, W, C)
         """
         batch_size = batch["imgs"].shape[0]
         sequence_length = self.config.sequence_length
         
         # 获取当前batch的时间戳
-        ts = batch["ts"] # (batch_size,), shuffled timestamps example
+        ts = batch["ts"] # (batch_size,), shuffled timestamps
+        
+        # 获取原始高斯参数（不进行任何变换）
+        original_means = self.scene_model.fg.params["means"]  # (num_gaussians, 3)
+        original_quats = self.scene_model.fg.params["quats"]  # (num_gaussians, 4)
+        original_scales = self.scene_model.fg.params["scales"]  # (num_gaussians, 3)
+        num_gaussians = original_means.shape[0]
         
         sequences = {
             'positions': [], # (batch_size, sequence_length, num_gaussians, 3)
             'orientations': [], # (batch_size, sequence_length, num_gaussians, 4)
             'scales': [], # (batch_size, sequence_length, num_gaussians, 3)
-            'target_images': [], # (batch_size, sequence_length, H, W, C) - 真实的序列目标图像
-            # 颜色和不透明度保持不变，不需要提取序列
+            'frame_ts': [], # (batch_size, sequence_length) - 时间戳序列
+            'target_images': [], # (batch_size, sequence_length, H, W, C)
         }
         
-        with torch.no_grad():
-            for i in range(batch_size):
-                center_t = ts[i].item()  # 这是数据集返回的时间戳
+        for i in range(batch_size):
+            center_t = ts[i].item()  # 这是数据集返回的时间戳
+            
+            # 安全检查：确保时间戳在有效范围内
+            max_valid_t = self.train_dataset.num_frames - 1
+            center_t = min(max(center_t, 0), max_valid_t)
+            
+            # 构建以当前帧为中心的时间序列
+            if sequence_length > 1:
+                half_seq = sequence_length // 2
                 
-                # 安全检查：确保时间戳在有效范围内
-                max_valid_t = self.train_dataset.num_frames - 1
-                center_t = min(max(center_t, 0), max_valid_t)
+                # 计算序列范围
+                ideal_start = center_t - half_seq
+                ideal_end = center_t + half_seq + (sequence_length % 2)
                 
-                # 构建以当前帧为中心的时间序列
-                if sequence_length > 1:
-                    half_seq = sequence_length // 2
-                    
-                    # 计算序列范围 - 这里我们需要确保序列是有效的
-                    # 经过数据集的处理（time_ids - start），时间戳已经是从0开始的连续整数
-                    ideal_start = center_t - half_seq
-                    ideal_end = center_t + half_seq + (sequence_length % 2)
-                    
-                    # 处理边界情况 - 确保索引在有效范围内
-                    if ideal_start < 0:
-                        start_t = 0
-                        end_t = min(sequence_length, self.train_dataset.num_frames)
-                    elif ideal_end >= self.train_dataset.num_frames:
-                        end_t = self.train_dataset.num_frames
-                        start_t = max(0, end_t - sequence_length)
-                    else:
-                        start_t = ideal_start
-                        end_t = ideal_end
-                    
-                    # 生成帧序列索引 (sequence_length,)
-                    frame_indices = list(range(start_t, end_t)) # 不包含end_t
-                    # example
-                    # center_t = 6, sequence_length = 10
-                    # frame_indices = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                # 处理边界情况
+                if ideal_start < 0:
+                    start_t = 0
+                    end_t = min(sequence_length, self.train_dataset.num_frames)
+                elif ideal_end >= self.train_dataset.num_frames:
+                    end_t = self.train_dataset.num_frames
+                    start_t = max(0, end_t - sequence_length)
                 else:
-                    frame_indices = [center_t]
+                    start_t = ideal_start
+                    end_t = ideal_end
                 
-                # 提取每帧的高斯参数和目标图像 - 只提取需要变形的参数
-                frame_positions = [] # (sequence_length, num_gaussians, 3)
-                frame_orientations = [] # (sequence_length, num_gaussians, 4)
-                frame_scales = [] # (sequence_length, num_gaussians, 3)
-                frame_target_images = [] # (sequence_length, H, W, C)
+                # 生成帧序列索引
+                frame_indices = list(range(start_t, end_t))
+            else:
+                frame_indices = [center_t]
+            
+            # 为每个序列添加原始参数（所有帧使用相同的原始参数）
+            frame_positions = []
+            frame_orientations = []
+            frame_scales = []
+            frame_target_images = []
+            frame_ts_list = []
+            
+            for frame_idx in frame_indices:
+                # 确保frame_idx在有效范围内
+                frame_idx = min(max(frame_idx, 0), max_valid_t)
                 
-                for frame_idx in frame_indices:
-                    # 确保frame_idx在有效范围内
-                    frame_idx = min(max(frame_idx, 0), max_valid_t)
-                    
-                    # 计算当前帧的高斯参数 - scene_model期望时间戳
-                    # 经过数据集处理后，时间戳等于索引（都是0到num_frames-1的连续整数）
-                    means, quats = self.scene_model.compute_poses_fg(torch.tensor([frame_idx], device=self.device))  
-                    # (num_gaussians, 3)
-                    scales = self.scene_model.fg.get_scales()
-                    # 颜色和不透明度保持不变，不需要每帧提取
-                    
-                    frame_positions.append(means[:, 0, :])  
-                    frame_orientations.append(quats[:, 0, :])  
-                    frame_scales.append(scales)
-                    
-                    # 提取对应的目标图像 - dataset.get_image期望索引
-                    # 时间戳和索引一致，所以可以直接使用frame_idx
-                    target_image = self.train_dataset.get_image(frame_idx).to(self.device)  # (H, W, C)
-                    frame_target_images.append(target_image)
+                # 使用原始参数（不进行变换）
+                frame_positions.append(original_means)  # (num_gaussians, 3)
+                frame_orientations.append(original_quats)  # (num_gaussians, 4)
+                frame_scales.append(original_scales)  # (num_gaussians, 3)
+                frame_ts_list.append(frame_idx) # (sequence_length,)
                 
-                # 堆叠为序列
-                sequences['positions'].append(torch.stack(frame_positions, dim=0))
-                sequences['orientations'].append(torch.stack(frame_orientations, dim=0))
-                sequences['scales'].append(torch.stack(frame_scales, dim=0))
-                sequences['target_images'].append(torch.stack(frame_target_images, dim=0))
+                # 提取对应的目标图像
+                target_image = self.train_dataset.get_image(frame_idx).to(self.device)  # (H, W, C)
+                frame_target_images.append(target_image)
+            
+            # 堆叠为序列
+            sequences['positions'].append(torch.stack(frame_positions, dim=0))
+            sequences['orientations'].append(torch.stack(frame_orientations, dim=0))
+            sequences['scales'].append(torch.stack(frame_scales, dim=0))
+            sequences['frame_ts'].append(torch.tensor(frame_ts_list, device=self.device))
+            sequences['target_images'].append(torch.stack(frame_target_images, dim=0))
         
         # 批量化序列
         for key in sequences:
-            sequences[key] = torch.stack(sequences[key], dim=0)  # (batch_size, seq_len, num_gaussians, dim)
+            sequences[key] = torch.stack(sequences[key], dim=0)
+
+        # print("sequences['frame_ts'].shape: ", sequences['frame_ts'].shape)
+        print("sequences['frame_ts']: ", sequences['frame_ts'])
         
         return sequences
     
-    def render_with_deformed_gaussians(self, batch, deformed_sequences):
-        """使用变形后的高斯参数进行渲染
+    def render_with_deformed_gaussians(self, batch, frame_ts, deltas):
+        """先变换高斯参数，再渲染高斯序列
         
         Args:
             batch: 包含图像、相机参数等的数据批次
@@ -292,29 +331,26 @@ class DeformTrainer:
                 ts: (batch_size,) 每帧的时间戳
                 w2cs: (batch_size, 4, 4) 世界坐标到相机坐标的变换矩阵
                 Ks: (batch_size, 3, 3) 相机内参矩阵
-                frame_names: []
-
-            deformed_sequences: 包含变形后高斯参数的字典
-                positions: (batch_size, seq_len, num_gaussians, 3) 位置参数
-                orientations: (batch_size, seq_len, num_gaussians, 4) 方向参数(四元数)
-                scales: (batch_size, seq_len, num_gaussians, 3) 尺度参数
+            frame_ts: 序列帧时间戳 (batch_size, sequence_length)
+            deltas: 变形增量字典
+                delta_pos: (batch_size, seq_len, num_gaussians, 3) 位置增量
+                delta_quat: (batch_size, seq_len, num_gaussians, 4) 方向增量
+                delta_scale: (batch_size, seq_len, num_gaussians, 3) 尺度增量
                 
         Returns:
-            torch.Tensor: 
-                - 如果 render_full_sequence=False: (batch_size, H, W, C) 只渲染中心帧
-                - 如果 render_full_sequence=True: (batch_size, seq_len, H, W, C) 渲染整个序列
+            torch.Tensor: (batch_size, seq_len, H, W, C) 渲染的序列图像
         """
         batch_size = batch["imgs"].shape[0]
-        seq_len = deformed_sequences['positions'].shape[1]
         # 从图像张量的形状中提取宽度和高度：batch["imgs"] 的形状为 (batch_size, height, width, channels)
         # 使用 shape[2:0:-1] 表示从索引 2 到索引 1（不包括0），并按步长 -1 反向切片
         # 即从 (B, H, W, C) 中提取出 (W, H)，用于表示图像的宽度和高度（注意顺序是 W, H）
+        seq_len = frame_ts.shape[1]
         img_wh = batch["imgs"].shape[2:0:-1]
 
         # 查看batch中的Ks和w2cs内容
-        print("batch.Ks and w2cs:")
-        print(batch["Ks"])
-        print(batch["w2cs"])
+        # print("batch.Ks and w2cs:")
+        # print(batch["Ks"])
+        # print(batch["w2cs"])
         
         if self.config.render_full_sequence:
             # 渲染整个序列
@@ -322,43 +358,55 @@ class DeformTrainer:
             
             for i in range(batch_size):
                 batch_rendered_imgs = []
-                t = batch["ts"][i].item()
                 w2c = batch["w2cs"][i]
                 K = batch["Ks"][i]
                 
                 for seq_idx in range(seq_len):
-                    # 从变形序列中获取当前时间步的变形后参数
-                    temp_means = deformed_sequences['positions'][i, seq_idx]  # (num_gaussians, 3)
-                    temp_quats = deformed_sequences['orientations'][i, seq_idx]  # (num_gaussians, 4)
-                    temp_scales = deformed_sequences['scales'][i, seq_idx]  # (num_gaussians, 3)
+                    current_t = frame_ts[i, seq_idx].item()
                     
-                    # 保存原始参数（用于恢复）
+                    # 1. 首先进行scene model的transformation
+                    with torch.no_grad():
+                        means, quats = self.scene_model.compute_poses_fg(
+                            torch.tensor([current_t], device=self.device)
+                        )
+                        # means: (num_gaussians, 1, 3), quats: (num_gaussians, 1, 4)
+                        transformed_means = means[:, 0, :]  # (num_gaussians, 3)
+                        transformed_quats = quats[:, 0, :]  # (num_gaussians, 4)
+                        transformed_scales = self.scene_model.fg.get_scales()  # (num_gaussians, 3)
+                    
+                    # 2. 然后应用变形增量
+                    final_means = transformed_means + deltas['delta_pos'][i, seq_idx]
+                    final_quats = self._apply_quat_delta(
+                        transformed_quats, deltas['delta_quat'][i, seq_idx]
+                    )
+                    final_scales = transformed_scales * torch.exp(deltas['delta_scale'][i, seq_idx])
+                    
+                    # 保存原始参数
                     original_means = self.scene_model.fg.params["means"]
                     original_quats = self.scene_model.fg.params["quats"]
                     original_scales = self.scene_model.fg.params["scales"]
                     
-                    # 临时替换为变形后的参数（保持梯度）
-                    self.scene_model.fg.params["means"] = temp_means
-                    self.scene_model.fg.params["quats"] = temp_quats  
-                    self.scene_model.fg.params["scales"] = temp_scales
+                    # 3. 临时替换为最终参数进行渲染
+                    self.scene_model.fg.params["means"] = final_means
+                    self.scene_model.fg.params["quats"] = final_quats
+                    self.scene_model.fg.params["scales"] = final_scales
                     
                     try:
-                        # 渲染图像 - 包含完整场景（前景+背景）
-                        # render函数会自动从scene_model.fg.params获取变形后的前景参数
-                        # 并从scene_model.bg获取原始背景参数
+                        # 渲染时不再调用compute_poses_fg，直接使用设置的参数
+                        # 传入None作为时间戳，避免重复变换
                         rendered = self.scene_model.render(
-                            t,
+                            None,  # 传入None避免重复变换
                             w2c[None],
                             K[None],
                             img_wh,
                             return_depth=False,
                             return_mask=False,
-                            fg_only=False  # 渲染完整场景，包含背景
+                            fg_only=False # 渲染完整场景，包含背景
                         )
                         
                         # 立即提取图像并释放rendered字典以节省内存
-                        img = rendered["img"][0].clone()
-                        del rendered  # 显式删除以帮助垃圾回收
+                        img = rendered["img"][0].clone() # 去掉batch维度得到 (H, W, 3)
+                        del rendered
                         batch_rendered_imgs.append(img)
                         
                     finally:
@@ -371,60 +419,16 @@ class DeformTrainer:
             
             return torch.stack(all_rendered_imgs, dim=0)  # (batch_size, seq_len, H, W, C)
         
-        # else:
-        #     # 只渲染中心帧
-        #     rendered_imgs = []
-        #     
-        #     for i in range(batch_size):
-        #         # 获取当前帧的变形参数
-        #         t = batch["ts"][i].item()
-        #         w2c = batch["w2cs"][i]
-        #         K = batch["Ks"][i]
-        #         
-        #         # 选择序列中心帧对应的变形参数
-        #         seq_center = self.config.sequence_length // 2
-        #         
-        #         # 从变形序列中获取变形后的参数
-        #         temp_means = deformed_sequences['positions'][i, seq_center]  # (num_gaussians, 3)
-        #         temp_quats = deformed_sequences['orientations'][i, seq_center]  # (num_gaussians, 4)
-        #         temp_scales = deformed_sequences['scales'][i, seq_center]  # (num_gaussians, 3)
-        #         
-        #         # 保存原始参数（用于恢复）
-        #         original_means = self.scene_model.fg.params["means"]
-        #         original_quats = self.scene_model.fg.params["quats"]
-        #         original_scales = self.scene_model.fg.params["scales"]
-        #         
-        #         # 临时替换为变形后的参数（保持梯度）
-        #         self.scene_model.fg.params["means"] = temp_means
-        #         self.scene_model.fg.params["quats"] = temp_quats
-        #         self.scene_model.fg.params["scales"] = temp_scales
-        #         
-        #         try:
-        #             # 渲染图像 - 包含完整场景（前景+背景）
-        #             # render函数会自动从scene_model.fg.params获取变形后的前景参数
-        #             # 并从scene_model.bg获取原始背景参数
-        #             rendered = self.scene_model.render(
-        #                 t,
-        #                 w2c[None], # 最前面增加了一个维度（batch 维度）
-        #                 K[None],
-        #                 img_wh,
-        #                 return_depth=False,
-        #                 return_mask=False,
-        #                 fg_only=False  # 渲染完整场景，包含背景
-        #             )
-        #             
-        #             rendered_imgs.append(rendered["img"][0])
-        #             
-        #         finally:
-        #             # 恢复原始参数
-        #             self.scene_model.fg.params["means"] = original_means
-        #             self.scene_model.fg.params["quats"] = original_quats
-        #             self.scene_model.fg.params["scales"] = original_scales
-        #     
-        #     return torch.stack(rendered_imgs, dim=0)  # (batch_size, H, W, C)
     
     def train_step(self, batch):
-        """单步训练"""
+        """单步训练
+        batch:
+            imgs: (batch_size, height, width, channels) 原始图像
+            ts: (batch_size,) 每帧的时间戳
+            w2cs: (batch_size, 4, 4) 世界坐标到相机坐标的变换矩阵
+            Ks: (batch_size, 3, 3) 相机内参矩阵
+            ...
+        """
         import time
         step_start = time.time()
         
@@ -440,6 +444,7 @@ class DeformTrainer:
         # 每个键的值是一个张量，形状为 (batch_size, sequence_length, num_gaussians, dim)
         gaussian_sequences = self.extract_gaussian_sequences(batch)
         seq_time = time.time() - seq_start
+        print("seq_extract_time: ", seq_time)
         
         # 2. 使用deform model优化序列
         deform_start = time.time()
@@ -455,98 +460,90 @@ class DeformTrainer:
         # 转换为deform model期望的格式：交换sequence_length和num_gaussians维度
         positions_input = gaussian_sequences['positions'].transpose(1, 2)  # (batch_size, num_gaussians, seq_len, 3)
         
-        # 分批处理以避免内存问题 - 只处理需要变形的参数
-        refined_sequences = {
-            'positions': [],
-            'orientations': [],
-            'scales': [],
-            # 颜色和不透明度保持不变，不需要在这里处理
+        # 获取deltas
+        deltas_sequence = {
+            'delta_pos': [],
+            'delta_quat': [],
+            'delta_scale': [],
         }
         
-        total_loss = 0.0
         
         for b in range(batch_size):
             sample_positions = positions_input[b]  # (num_gaussians, seq_len, 3) - 单个样本的所有高斯点位置序列
             
+            # 获取时间编码
+            frame_timesteps = gaussian_sequences['frame_ts'][b]  # (seq_len,)
+            time_encoding = self.temporal_encoding(frame_timesteps)  # (seq_len, temporal_encoding_dim)
+            
             if self.config.use_chunked_processing:
                 # 分块处理高斯点（节省内存）
                 chunk_size = self.config.chunk_size
-                sample_refined_pos = [] 
-                sample_refined_quat = []
-                sample_refined_scale = []
+                sample_delta_pos = []
+                sample_delta_quat = []
+                sample_delta_scale = []
                 
                 for chunk_start in range(0, num_gaussians, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, num_gaussians)
                     chunk_positions = sample_positions[chunk_start:chunk_end]  # (chunk_size, seq_len, 3)
                     
-                    # 前向传播
-                    deltas = self.deform_model(chunk_positions) 
+                    # 为每个高斯点复制时间编码
+                    chunk_size_actual = chunk_positions.shape[0] # chunked高斯点数量
+                    chunk_time_encoding = time_encoding.unsqueeze(0).expand(chunk_size_actual, -1, -1)  
+                    # (chunk_size, seq_len, temporal_encoding_dim)
+                    
+                    # 拼接位置和时间编码
+                    chunk_input = torch.cat([chunk_positions, chunk_time_encoding], dim=-1)  
+                    # (chunk_size, seq_len, 3 + temporal_encoding_dim)
+                    
+                    # 前向传播 - 直接获取deltas
+                    deltas = self.deform_model(chunk_input)
                     # return: delta_pos, delta_quat, delta_scale
                     # shape: (chunk_size, seq_len, 3), (chunk_size, seq_len, 4), (chunk_size, seq_len, 3)
                     
-                    # 应用变形
-                    refined_pos = chunk_positions + deltas['delta_pos'] # (chunk_size, seq_len, 3)
-                    sample_refined_pos.append(refined_pos) # (length, chunk_size, seq_len, 3)
-                    
-                    # 处理其他属性
-                    chunk_orientations = gaussian_sequences['orientations'][b, :, chunk_start:chunk_end, :].transpose(0, 1)
-                    # shape: (chunk_size, seq_len, 4)
-                    chunk_scales = gaussian_sequences['scales'][b, :, chunk_start:chunk_end, :].transpose(0, 1)
-                    # shape: (chunk_size, seq_len, 3)
-                    
-                    refined_quat = self._apply_quat_delta(chunk_orientations, deltas['delta_quat'])
-                    # shape: (chunk_size, seq_len, 4)
-                    refined_scale = chunk_scales * torch.exp(deltas['delta_scale'])
-                    # shape: (chunk_size, seq_len, 3)
-                    
-                    sample_refined_quat.append(refined_quat) # (length, chunk_size, seq_len, 4)
-                    sample_refined_scale.append(refined_scale) # (length, chunk_size, seq_len, 3)
+                    sample_delta_pos.append(deltas['delta_pos'])
+                    sample_delta_quat.append(deltas['delta_quat'])
+                    sample_delta_scale.append(deltas['delta_scale'])
                 
-                # 合并块
-                refined_sequences['positions'].append(torch.cat(sample_refined_pos, dim=0).transpose(0, 1)) # 交换num_gaussians和seq_len维度
+                # 合并块并调整维度顺序
+                deltas_sequence['delta_pos'].append(torch.cat(sample_delta_pos, dim=0).transpose(0, 1)) # 交换num_gaussians和seq_len维度
                 # shape: (batch_size, seq_len, num_gaussians, 3)
-                refined_sequences['orientations'].append(torch.cat(sample_refined_quat, dim=0).transpose(0, 1))
-                # shape: (batch_size, seq_len, num_gaussians, 4)
-                refined_sequences['scales'].append(torch.cat(sample_refined_scale, dim=0).transpose(0, 1))
+                deltas_sequence['delta_quat'].append(torch.cat(sample_delta_quat, dim=0).transpose(0, 1)) # 交换num_gaussians和seq_len维度
+                # shape: (batch_size, seq_len, num_gaussians, 4)    
+                deltas_sequence['delta_scale'].append(torch.cat(sample_delta_scale, dim=0).transpose(0, 1)) # 交换num_gaussians和seq_len维度
                 # shape: (batch_size, seq_len, num_gaussians, 3)
-                # 颜色和不透明度保持不变，不需要添加到refined_sequences
                 
             else:
-                # 不分块处理（可能消耗更多内存但更快）
-                # 直接处理所有高斯点
-                # 前向传播
-                deltas = self.deform_model(sample_positions)
+                # 不分块处理
+                # 为所有高斯点复制时间编码
+                sample_time_encoding = time_encoding.unsqueeze(0).expand(num_gaussians, -1, -1)  # (num_gaussians, seq_len, temporal_encoding_dim)
                 
-                # 应用变形
-                refined_pos = sample_positions + deltas['delta_pos']
+                # 拼接位置和时间编码
+                sample_input = torch.cat([sample_positions, sample_time_encoding], dim=-1)  # (num_gaussians, seq_len, 3 + temporal_encoding_dim)
                 
-                # 处理其他属性
-                sample_orientations = gaussian_sequences['orientations'][b, :, :, :].transpose(0, 1)
-                sample_scales = gaussian_sequences['scales'][b, :, :, :].transpose(0, 1)
+                deltas = self.deform_model(sample_input)
                 
-                refined_quat = self._apply_quat_delta(sample_orientations, deltas['delta_quat'])
-                refined_scale = sample_scales * torch.exp(deltas['delta_scale'])
-                
-                # 直接添加结果
-                refined_sequences['positions'].append(refined_pos.transpose(0, 1))
-                refined_sequences['orientations'].append(refined_quat.transpose(0, 1))
-                refined_sequences['scales'].append(refined_scale.transpose(0, 1))
+                # 直接添加结果，调整维度顺序
+                deltas_sequence['delta_pos'].append(deltas['delta_pos'].transpose(0, 1))
+                deltas_sequence['delta_quat'].append(deltas['delta_quat'].transpose(0, 1))
+                deltas_sequence['delta_scale'].append(deltas['delta_scale'].transpose(0, 1))
                    
         # 堆叠批次
-        for key in refined_sequences:
-            refined_sequences[key] = torch.stack(refined_sequences[key], dim=0)
-            # key: positions, orientations, scales
+        for key in deltas_sequence:
+            deltas_sequence[key] = torch.stack(deltas_sequence[key], dim=0)
+            # key: delta_pos, delta_quat, delta_scale
             # shape: (batch_size, seq_len, num_gaussians, dim)
         
         deform_time = time.time() - deform_start
+        print("deform_time: ", deform_time)
         
         # 3. 渲染并计算损失
         render_start = time.time()
-        # 返回的rendered_imgs是(B, T, H, W, 3)
+        # 直接使用deltas_sequence进行渲染
         with torch.cuda.amp.autocast(enabled=False):  # 禁用自动混合精度以避免潜在的内存问题
-            rendered_imgs = self.render_with_deformed_gaussians(batch, refined_sequences)
+            rendered_imgs = self.render_with_deformed_gaussians(batch, gaussian_sequences['frame_ts'], deltas_sequence)
         render_time = time.time() - render_start
-        
+        print("render_time: ", render_time)
+
         # 4. 损失计算
         loss_start = time.time()
         if self.config.render_full_sequence:
@@ -583,29 +580,11 @@ class DeformTrainer:
             target_ssim = target_imgs.permute(0, 1, 4, 2, 3).reshape(B * T, C, H, W)  # (B*T, C, H, W)
             
             ssim_rgb_loss = 1.0 - ssim(rendered_ssim, target_ssim)
-            rgb_loss = (1 - self.config.ssim_weight) * l1_rgb_loss + self.config.ssim_weight * ssim_rgb_loss
-        # else:
-        #     # 只渲染中心帧: rendered_imgs.shape = (B, H, W, 3)
-        #     target_imgs = batch["imgs"]  # (B, H, W, 3)
-        #     
-        #     # 确保形状匹配
-        #     assert rendered_imgs.shape == target_imgs.shape, \
-        #         f"Shape mismatch: rendered_imgs {rendered_imgs.shape} vs target_imgs {target_imgs.shape}"
-        #     
-        #     # RGB损失 - 使用L1损失和SSIM损失的组合
-        #     l1_rgb_loss = l1_loss(rendered_imgs, target_imgs)
-        #     
-        #     # SSIM需要(N, C, H, W)格式，需要重塑张量
-        #     # rendered_imgs和target_imgs的形状都是(B, H, W, C)
-        #     rendered_ssim = rendered_imgs.permute(0, 3, 1, 2)  # (B, C, H, W)
-        #     target_ssim = target_imgs.permute(0, 3, 1, 2)  # (B, C, H, W)
-        #     
-        #     ssim_rgb_loss = 1.0 - ssim(rendered_ssim, target_ssim)
-        #     rgb_loss = (1 - self.config.ssim_weight) * l1_rgb_loss + self.config.ssim_weight * ssim_rgb_loss
-    
+            rgb_loss = (1 - self.config.ssim_weight) * l1_rgb_loss + self.config.ssim_weight * ssim_rgb_loss    
             
         loss_time = time.time() - loss_start
-        
+        print("loss_time: ", loss_time)
+
         # 5. 反向传播
         backward_start = time.time()
         # 将损失除以累积步数以获得平均梯度
@@ -618,9 +597,10 @@ class DeformTrainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
         backward_time = time.time() - backward_start
-        
+        print("backward_time: ", backward_time)
         total_time = time.time() - step_start
-        
+        print("total_time: ", total_time)
+
         # 打印各步骤耗时
         if self.global_step % 10 == 0:
             guru.info(f"⏱️  Step {self.global_step} Timing:")
@@ -664,61 +644,62 @@ class DeformTrainer:
                 batch_size, seq_len, num_gaussians, _ = gaussian_sequences['positions'].shape
                 positions_input = gaussian_sequences['positions'].transpose(1, 2)  # (batch_size, num_gaussians, seq_len, 3)
                 
-                refined_sequences = {
-                    'positions': [],
-                    'orientations': [],
-                    'scales': [],
+                deltas_sequence = {
+                    'delta_pos': [],
+                    'delta_quat': [],
+                    'delta_scale': [],
                 }
                 
                 for b in range(batch_size):
                     sample_positions = positions_input[b]  # (num_gaussians, seq_len, 3)
                     
+                    # 获取时间编码
+                    frame_timesteps = gaussian_sequences['frame_ts'][b]  # (seq_len,)
+                    time_encoding = self.temporal_encoding(frame_timesteps)  # (seq_len, temporal_encoding_dim)
+                    
                     # 使用分块处理（与训练一致）
                     if self.config.use_chunked_processing:
                         chunk_size = self.config.chunk_size
-                        sample_refined_pos = []
-                        sample_refined_quat = []
-                        sample_refined_scale = []
+                        sample_delta_pos = []
+                        sample_delta_quat = []
+                        sample_delta_scale = []
                         
                         for chunk_start in range(0, num_gaussians, chunk_size):
                             chunk_end = min(chunk_start + chunk_size, num_gaussians)
                             chunk_positions = sample_positions[chunk_start:chunk_end]
                             
-                            deltas = self.deform_model(chunk_positions)
-                            refined_pos = chunk_positions + deltas['delta_pos']
-                            sample_refined_pos.append(refined_pos)
+                            # 为每个高斯点复制时间编码
+                            chunk_size_actual = chunk_positions.shape[0]
+                            chunk_time_encoding = time_encoding.unsqueeze(0).expand(chunk_size_actual, -1, -1)
                             
-                            chunk_orientations = gaussian_sequences['orientations'][b, :, chunk_start:chunk_end, :].transpose(0, 1)
-                            chunk_scales = gaussian_sequences['scales'][b, :, chunk_start:chunk_end, :].transpose(0, 1)
+                            # 拼接位置和时间编码
+                            chunk_input = torch.cat([chunk_positions, chunk_time_encoding], dim=-1)
                             
-                            refined_quat = self._apply_quat_delta(chunk_orientations, deltas['delta_quat'])
-                            refined_scale = chunk_scales * torch.exp(deltas['delta_scale'])
-                            
-                            sample_refined_quat.append(refined_quat)
-                            sample_refined_scale.append(refined_scale)
+                            deltas = self.deform_model(chunk_input)
+                            sample_delta_pos.append(deltas['delta_pos'])
+                            sample_delta_quat.append(deltas['delta_quat'])
+                            sample_delta_scale.append(deltas['delta_scale'])
                         
-                        refined_sequences['positions'].append(torch.cat(sample_refined_pos, dim=0).transpose(0, 1))
-                        refined_sequences['orientations'].append(torch.cat(sample_refined_quat, dim=0).transpose(0, 1))
-                        refined_sequences['scales'].append(torch.cat(sample_refined_scale, dim=0).transpose(0, 1))
+                        deltas_sequence['delta_pos'].append(torch.cat(sample_delta_pos, dim=0).transpose(0, 1))
+                        deltas_sequence['delta_quat'].append(torch.cat(sample_delta_quat, dim=0).transpose(0, 1))
+                        deltas_sequence['delta_scale'].append(torch.cat(sample_delta_scale, dim=0).transpose(0, 1))
                     else:
-                        deltas = self.deform_model(sample_positions)
-                        refined_pos = sample_positions + deltas['delta_pos']
+                        # 为所有高斯点复制时间编码
+                        sample_time_encoding = time_encoding.unsqueeze(0).expand(num_gaussians, -1, -1)
                         
-                        sample_orientations = gaussian_sequences['orientations'][b, :, :, :].transpose(0, 1)
-                        sample_scales = gaussian_sequences['scales'][b, :, :, :].transpose(0, 1)
+                        # 拼接位置和时间编码
+                        sample_input = torch.cat([sample_positions, sample_time_encoding], dim=-1)
                         
-                        refined_quat = self._apply_quat_delta(sample_orientations, deltas['delta_quat'])
-                        refined_scale = sample_scales * torch.exp(deltas['delta_scale'])
-                        
-                        refined_sequences['positions'].append(refined_pos.transpose(0, 1))
-                        refined_sequences['orientations'].append(refined_quat.transpose(0, 1))
-                        refined_sequences['scales'].append(refined_scale.transpose(0, 1))
+                        deltas = self.deform_model(sample_input)
+                        deltas_sequence['delta_pos'].append(deltas['delta_pos'].transpose(0, 1))
+                        deltas_sequence['delta_quat'].append(deltas['delta_quat'].transpose(0, 1))
+                        deltas_sequence['delta_scale'].append(deltas['delta_scale'].transpose(0, 1))
                 
                 # 堆叠批次
-                for key in refined_sequences:
-                    refined_sequences[key] = torch.stack(refined_sequences[key], dim=0)
+                for key in deltas_sequence:
+                    deltas_sequence[key] = torch.stack(deltas_sequence[key], dim=0)
                 
-                rendered_imgs = self.render_with_deformed_gaussians(batch, refined_sequences)
+                rendered_imgs = self.render_with_deformed_gaussians(batch, gaussian_sequences['frame_ts'], deltas_sequence)
                 
                 # 使用与训练相同的L1+SSIM组合损失
                 target_imgs = batch["imgs"]  # (B, H, W, C)
@@ -771,9 +752,14 @@ def main(cfg: DeformTrainConfig):
     # 创建工作目录
     os.makedirs(cfg.work_dir, exist_ok=True)
     
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    guru.info(f"Using device: {device}")
+    # 设置CUDA设备
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = cfg.devices
+        device = torch.device("cuda:0")  # 使用第一个可见设备
+        guru.info(f"Using CUDA devices: {cfg.devices}, mapped to cuda:0")
+    else:
+        device = torch.device("cpu")
+        guru.info("CUDA not available, using CPU")
     
     # 加载数据
     train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (

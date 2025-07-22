@@ -14,16 +14,33 @@ Key Memory Optimizations:
 - REDUCED validation frequency to prevent hanging
 
 Usage:
-    python run_deform_memory_optimized.py
+    python run_deform_memory_optimized.py [--cuda-device DEVICE_ID]
+    
+Arguments:
+    --cuda-device: CUDA device index to use (default: 0)
 """
 
+import argparse
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Memory-optimized deformation training')
+    parser.add_argument('--cuda-device', type=int, default=3, 
+                       help='CUDA device index to use (default: 0)')
+    return parser.parse_args()
+
 def main():
+    args = parse_args()
+    
     print("🚀 Starting ULTRA memory-optimized deformation training...")
+    print(f"🎯 Using CUDA device: {args.cuda_device}")
+    
+    # 设置CUDA设备环境变量
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
+    
     print("\n📊 Performance Analysis:")
     print("Flow3d training: 1 render call per step")
     print("Deformation training: sequence_length × render calls per step")
@@ -40,18 +57,21 @@ def main():
         "--validate_every", "25",  # 进一步减少验证频率
         "--save_every", "5",
         "--num_epochs", "50",  # 先训练较少的epochs进行测试
+        "--devices", str(args.cuda_device),  # 指定CUDA设备
+        "--resume_from", "refined_output/deform_checkpoint_epoch_10.pth",
         "data:iphone",  # 数据配置必须在最后，格式为data:iphone
         "--data.data-dir", "data/iPhone/paper-windmill"
     ]
     
     print("\n⚡ ULTRA Memory optimizations applied:")
     print("- Batch size: 1")
-    print("- Sequence length: 2 (MINIMAL - previous+current frame)")
+    print("- Sequence length: 3 (MINIMAL - previous+current frame)")
     print("- Render calls per step: 2 (vs flow3d's 1)")
     print("- Render full sequence: TRUE (required for temporal loss)")
     print("- Workers: 1")
     print("- Epochs: 50 (for testing)")
     print("- Validation frequency: ULTRA-REDUCED to every 25 epochs")
+    print(f"- CUDA device: {args.cuda_device}")
     print("\n🎯 Expected speedup: ~33% faster than length=3 configuration")
     print("⚠️  Trade-off: Shorter temporal context for model learning")
     
