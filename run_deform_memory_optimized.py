@@ -35,16 +35,16 @@ def parse_args():
 def main():
     args = parse_args()
     
-    print("🚀 Starting ULTRA memory-optimized deformation training...")
-    print(f"🎯 Using CUDA device: {args.cuda_device}")
+    # print("🚀 Starting ULTRA memory-optimized deformation training...")
+    # print(f"🎯 Using CUDA device: {args.cuda_device}")
     
     # 设置CUDA设备环境变量
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
     
-    print("\n📊 Performance Analysis:")
-    print("Flow3d training: 1 render call per step")
-    print("Deformation training: sequence_length × render calls per step")
-    print("With sequence_length=2: Only 2×slower than flow3d (vs 3×slower with length=3)")
+    # print("\n📊 Performance Analysis:")
+    # print("Flow3d training: 1 render call per step")
+    # print("Deformation training: sequence_length × render calls per step")
+    # print("With sequence_length=2: Only 2×slower than flow3d (vs 3×slower with length=3)")
     
     # 设置内存优化的参数 - 保持render_full_sequence=True但优化其他方面
     cmd = [
@@ -54,26 +54,27 @@ def main():
         "--batch_size", "1",  # 最小batch size
         "--sequence_length", "3",  # 极简序列：只有前帧+当前帧，最小化渲染次数
         "--num_dl_workers", "1",
-        "--validate_every", "25",  # 进一步减少验证频率
+        "--validate_every", "5",  # 进一步减少验证频率
         "--save_every", "5",
         "--num_epochs", "50",  # 先训练较少的epochs进行测试
         "--devices", str(args.cuda_device),  # 指定CUDA设备
-        "--resume_from", "refined_output/deform_checkpoint_epoch_10.pth",
+        "--no-use-chunked-processing",
+        # "--resume_from", "refined_output/deform_checkpoint_epoch_10.pth",
         "data:iphone",  # 数据配置必须在最后，格式为data:iphone
         "--data.data-dir", "data/iPhone/paper-windmill"
     ]
     
-    print("\n⚡ ULTRA Memory optimizations applied:")
-    print("- Batch size: 1")
-    print("- Sequence length: 3 (MINIMAL - previous+current frame)")
-    print("- Render calls per step: 2 (vs flow3d's 1)")
-    print("- Render full sequence: TRUE (required for temporal loss)")
-    print("- Workers: 1")
-    print("- Epochs: 50 (for testing)")
-    print("- Validation frequency: ULTRA-REDUCED to every 25 epochs")
-    print(f"- CUDA device: {args.cuda_device}")
-    print("\n🎯 Expected speedup: ~33% faster than length=3 configuration")
-    print("⚠️  Trade-off: Shorter temporal context for model learning")
+    # print("\n⚡ ULTRA Memory optimizations applied:")
+    # print("- Batch size: 1")
+    # print("- Sequence length: 3 (MINIMAL - previous+current frame)")
+    # print("- Render calls per step: 2 (vs flow3d's 1)")
+    # print("- Render full sequence: TRUE (required for temporal loss)")
+    # print("- Workers: 1")
+    # print("- Epochs: 50 (for testing)")
+    # print("- Validation frequency: ULTRA-REDUCED to every 25 epochs")
+    # print(f"- CUDA device: {args.cuda_device}")
+    # print("\n🎯 Expected speedup: ~33% faster than length=3 configuration")
+    # print("⚠️  Trade-off: Shorter temporal context for model learning")
     
     print(f"\n🔧 Command: {' '.join(cmd)}")
     print()

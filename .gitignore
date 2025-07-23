@@ -15,7 +15,6 @@ preproc/checkpoints/
 
 # Large directories and files
 data/
-Gaussian_Sequence/
 output/
 refined_output/
 *.png

@@ -107,11 +107,11 @@ class DeformTrainConfig:
     # Deform model 参数
     temporal_encoding_dim: int = 16  # 时间编码维度
     lstm_input_dim: int = 19  # 3 (位置) + 16 (时间编码) = 19
-    lstm_hidden_dim: int = 256
+    lstm_hidden_dim: int = 128
     lstm_num_layers: int = 2
     lstm_dropout: float = 0.1
-    graph_input_dim: int = 512
-    graph_hidden_dim: int = 256
+    graph_input_dim: int = 256
+    graph_hidden_dim: int = 128
     graph_num_layers: int = 3
     graph_k: int = 16
     graph_dropout: float = 0.1
@@ -326,7 +326,7 @@ class DeformTrainer:
             sequences[key] = torch.stack(sequences[key], dim=0)
 
         # print("sequences['frame_ts'].shape: ", sequences['frame_ts'].shape)
-        print("sequences['frame_ts']: ", sequences['frame_ts'])
+        # print("sequences['frame_ts']: ", sequences['frame_ts'])
         
         return sequences
     
@@ -609,14 +609,14 @@ class DeformTrainer:
         # print("total_time: ", total_time)
 
         # 打印各步骤耗时
-        if self.global_step % 10 == 0:
-            guru.info(f"⏱️  Step {self.global_step} Timing:")
-            guru.info(f"  1. Extract sequences: {seq_time:.3f}s ({seq_time/total_time*100:.1f}%)")
-            guru.info(f"  2. Deform model: {deform_time:.3f}s ({deform_time/total_time*100:.1f}%)")
-            guru.info(f"  3. Render: {render_time:.3f}s ({render_time/total_time*100:.1f}%)")
-            guru.info(f"  4. Loss calc: {loss_time:.3f}s ({loss_time/total_time*100:.1f}%)")
-            guru.info(f"  5. Backward: {backward_time:.3f}s ({backward_time/total_time*100:.1f}%)")
-            guru.info(f"  Total: {total_time:.3f}s")
+        # if self.global_step % 10 == 0:
+        #     guru.info(f"⏱️  Step {self.global_step} Timing:")
+        #     guru.info(f"  1. Extract sequences: {seq_time:.3f}s ({seq_time/total_time*100:.1f}%)")
+        #     guru.info(f"  2. Deform model: {deform_time:.3f}s ({deform_time/total_time*100:.1f}%)")
+        #     guru.info(f"  3. Render: {render_time:.3f}s ({render_time/total_time*100:.1f}%)")
+        #     guru.info(f"  4. Loss calc: {loss_time:.3f}s ({loss_time/total_time*100:.1f}%)")
+        #     guru.info(f"  5. Backward: {backward_time:.3f}s ({backward_time/total_time*100:.1f}%)")
+        #     guru.info(f"  Total: {total_time:.3f}s")
         
         self.global_step += 1
         
