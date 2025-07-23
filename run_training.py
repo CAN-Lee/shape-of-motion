@@ -159,6 +159,7 @@ def main(cfg: TrainConfig):
             pbar.set_description(f"Loss: {loss:.6f}")
 
         if validator is not None:
+            # 在每个validate_every个epoch后进行验证，或在最后一个epoch进行验证
             if (epoch > 0 and epoch % cfg.validate_every == 0) or (
                 epoch == cfg.num_epochs - 1
             ):
